@@ -103,4 +103,3 @@ wss.on("connection", (clientWs) => {
 });
 
 server.listen(PORT, () => console.log(`🚀 Proxy running on port ${PORT}`));
-
