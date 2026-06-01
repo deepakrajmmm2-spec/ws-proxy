@@ -1,13 +1,15 @@
 {
   "name": "ws-proxy",
-  "version": "1.0.0",
+  "version": "2.0.0",
+  "description": "Angel One SmartStream WebSocket relay proxy for ProChain",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.21.2",
-    "ws": "^8.18.0",
-    "node-fetch": "^3.3.2"
+    "ws": "^8.17.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
