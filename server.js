@@ -1,139 +1,127 @@
-// server.js — ProChain Railway Backend v3.0
-// HTTP REST proxy + WebSocket proxy (SmartAPI Angel One)
-// npm install express http-proxy-middleware ws http-proxy-agent https-proxy-agent
-
-const express = require("express");
-const { createProxyMiddleware } = require("http-proxy-middleware");
-const http = require("http");
-const WebSocket = require("ws");
+const express = require('express');
+const axios = require('axios');
+const cors = require('cors');
+const WebSocket = require('ws');
+const http = require('http');
 
 const app = express();
 const server = http.createServer(app);
 
-// ── CORS ─────────────────────────────────────────────────────────────
-app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Headers", "*");
-  res.header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
-  if (req.method === "OPTIONS") return res.sendStatus(200);
-  next();
+// ─── CORS ───────────────────────────────────────────────────────────────────
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-UserType', 'X-SourceID',
+                   'X-ClientLocalIP', 'X-ClientPublicIP', 'X-MACAddress',
+                   'X-PrivateKey', 'apikey', 'jwttoken']
+}));
+app.use(express.json());
+
+// ─── ANGEL ONE BASE URLs ─────────────────────────────────────────────────────
+const ANGEL_BASE     = 'https://apiconnect.angelone.in';
+const ANGEL_WS_URL   = 'wss://smartapisocket.angelone.in/smart-stream';
+
+// ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', service: 'ProChain Proxy', time: new Date().toISOString() });
 });
 
-// ── Health check ─────────────────────────────────────────────────────
-app.get("/health", (req, res) => res.json({ status: "ok", ts: Date.now() }));
+// ─── REST PROXY ───────────────────────────────────────────────────────────────
+// Usage: POST /proxy  body: { url, method, headers, data }
+app.post('/proxy', async (req, res) => {
+  const { url, method = 'GET', headers = {}, data } = req.body;
 
-// ── Angel One REST proxy ──────────────────────────────────────────────
-app.use("/angel", createProxyMiddleware({
-  target: "https://apiconnect.angelone.in",
-  changeOrigin: true,
-  pathRewrite: { "^/angel": "" },
-  on: {
-    error: (err, req, res) => {
-      console.error("[ANGEL REST]", err.message);
-      res.status(502).json({ error: "Angel REST proxy error", detail: err.message });
-    }
+  if (!url) return res.status(400).json({ error: 'url required' });
+
+  // Only allow Angel One endpoints
+  if (!url.startsWith(ANGEL_BASE)) {
+    return res.status(403).json({ error: 'Only Angel One API calls allowed' });
   }
-}));
 
-// ── Dhan REST proxy ───────────────────────────────────────────────────
-app.use("/dhan", createProxyMiddleware({
-  target: "https://api.dhan.co",
-  changeOrigin: true,
-  pathRewrite: { "^/dhan": "" },
-  on: {
-    error: (err, req, res) => {
-      console.error("[DHAN REST]", err.message);
-      res.status(502).json({ error: "Dhan REST proxy error", detail: err.message });
-    }
-  }
-}));
-
-// ── NSE REST proxy ────────────────────────────────────────────────────
-app.use("/nse", createProxyMiddleware({
-  target: "https://www.nseindia.com",
-  changeOrigin: true,
-  pathRewrite: { "^/nse": "" },
-  headers: {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json"
-  },
-  on: {
-    error: (err, req, res) => {
-      console.error("[NSE REST]", err.message);
-      res.status(502).json({ error: "NSE REST proxy error", detail: err.message });
-    }
-  }
-}));
-
-// ── WebSocket Proxy — Angel One SmartAPI ─────────────────────────────
-// Frontend connects: wss://your-railway-app.up.railway.app/ws
-// Backend forwards to: wss://smartapiws.angelone.in/
-const ANGEL_WS_URL = "wss://smartapiws.angelone.in/";
-
-const wss = new WebSocket.Server({ noServer: true });
-
-wss.on("connection", (clientWs) => {
-  console.log("[WS] Client connected — opening upstream to Angel SmartAPI");
-
-  const upstream = new WebSocket(ANGEL_WS_URL);
-  upstream.binaryType = "arraybuffer";
-
-  // CLIENT → ANGEL
-  clientWs.on("message", (data) => {
-    if (upstream.readyState === WebSocket.OPEN) {
-      upstream.send(data);
-    }
-  });
-
-  // ANGEL → CLIENT
-  upstream.on("message", (data) => {
-    if (clientWs.readyState === WebSocket.OPEN) {
-      clientWs.send(data);
-    }
-  });
-
-  // Upstream errors
-  upstream.on("error", (err) => {
-    console.error("[WS upstream error]", err.message);
-    clientWs.close(1011, "upstream_error");
-  });
-
-  upstream.on("close", (code, reason) => {
-    console.log(`[WS upstream closed] ${code} ${reason}`);
-    if (clientWs.readyState === WebSocket.OPEN) {
-      clientWs.close(code, reason);
-    }
-  });
-
-  // Client disconnect
-  clientWs.on("close", (code, reason) => {
-    console.log(`[WS client disconnected] ${code} ${reason}`);
-    if (upstream.readyState !== WebSocket.CLOSED) {
-      upstream.close();
-    }
-  });
-
-  clientWs.on("error", (err) => {
-    console.error("[WS client error]", err.message);
-    if (upstream.readyState !== WebSocket.CLOSED) upstream.close();
-  });
-});
-
-// ── HTTP Upgrade → WebSocket server ──────────────────────────────────
-server.on("upgrade", (req, socket, head) => {
-  if (req.url === "/ws") {
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit("connection", ws, req);
+  try {
+    const response = await axios({
+      url,
+      method,
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        ...headers
+      },
+      data,
+      timeout: 15000
     });
-  } else {
-    socket.destroy();
+    res.json(response.data);
+  } catch (err) {
+    const status = err.response?.status || 500;
+    const body   = err.response?.data  || { error: err.message };
+    res.status(status).json(body);
   }
 });
 
-// ── Start ─────────────────────────────────────────────────────────────
+// ─── WEBSOCKET BRIDGE ─────────────────────────────────────────────────────────
+// Client connects to ws://YOUR_RAILWAY_URL/ws?token=JWT&feedToken=FEED&clientCode=CODE
+const wss = new WebSocket.Server({ server, path: '/ws' });
+
+wss.on('connection', (clientWs, req) => {
+  const params     = new URLSearchParams(req.url.replace('/ws?', ''));
+  const token      = params.get('token');
+  const feedToken  = params.get('feedToken');
+  const clientCode = params.get('clientCode');
+
+  if (!token || !feedToken || !clientCode) {
+    clientWs.close(4001, 'Missing token/feedToken/clientCode');
+    return;
+  }
+
+  console.log(`[WS] Client connected: ${clientCode}`);
+
+  // Connect to Angel One SmartStream
+  const angelWs = new WebSocket(ANGEL_WS_URL, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'x-feed-token': feedToken,
+      'x-client-code': clientCode
+    }
+  });
+
+  angelWs.on('open', () => {
+    console.log(`[WS] Angel One connected for ${clientCode}`);
+    clientWs.send(JSON.stringify({ type: 'connected', message: 'Angel One WS bridge ready' }));
+  });
+
+  // Forward Angel → Client
+  angelWs.on('message', (data) => {
+    if (clientWs.readyState === WebSocket.OPEN) clientWs.send(data);
+  });
+
+  // Forward Client → Angel
+  clientWs.on('message', (data) => {
+    if (angelWs.readyState === WebSocket.OPEN) angelWs.send(data);
+  });
+
+  angelWs.on('error', (err) => {
+    console.error('[WS] Angel error:', err.message);
+    clientWs.send(JSON.stringify({ type: 'error', message: err.message }));
+  });
+
+  angelWs.on('close', (code, reason) => {
+    console.log(`[WS] Angel closed: ${code}`);
+    if (clientWs.readyState === WebSocket.OPEN) clientWs.close(code, reason);
+  });
+
+  clientWs.on('close', () => {
+    console.log(`[WS] Client disconnected: ${clientCode}`);
+    if (angelWs.readyState === WebSocket.OPEN) angelWs.close();
+  });
+
+  clientWs.on('error', (err) => {
+    console.error('[WS] Client error:', err.message);
+    if (angelWs.readyState === WebSocket.OPEN) angelWs.close();
+  });
+});
+
+// ─── START ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`[ProChain Backend] Running on port ${PORT}`);
-  console.log(`[REST] /angel /dhan /nse proxy active`);
-  console.log(`[WS] /ws → ${ANGEL_WS_URL}`);
+  console.log(`ProChain Proxy running on port ${PORT}`);
 });
