@@ -1,128 +1,218 @@
-const express = require("express");
-const http = require("http");
-const WebSocket = require("ws");
+/**
+ * ws-proxy — Angel One SmartStream WebSocket Relay
+ * Railway pe deploy karo — ProChain ka /ws endpoint yahi handle karta hai
+ *
+ * Routes:
+ *   GET  /health   → {"status":"ok"}
+ *   GET  /ping     → {"pong":true}
+ *   WS   /ws       → Angel One SmartStream relay (binary + text frames)
+ *   GET  /api/*    → Angel One REST API proxy (CORS fix)
+ *   POST /api/*    → Angel One REST API proxy (CORS fix)
+ */
 
-const app = express();
-const server = http.createServer(app);
+const http       = require("http");
+const https      = require("https");
+const WebSocket  = require("ws");
+const url        = require("url");
 
-const PORT = process.env.PORT || 3000;
-const ANGEL_ONE_WS = "wss://smartapisocket.angelone.in/smart-stream";
-const ANGEL_BASE = "https://apiconnect.angelone.in";
-const DHAN_BASE = "https://api.dhan.co";
-const NSE_BASE = "https://www.nseindia.com";
+// ── Config
+const PORT         = process.env.PORT || 3000;
+const PROXY_SECRET = process.env.PROXY_SECRET || "";          // Railway env var
+const ANGEL_WS_URL = "wss://smartapisocket.angelone.in/smart-stream"; // Angel One live WS
 
-// Angel One path map
-const ANGEL_PATH_MAP = {
-  "/angel/login":        "/rest/auth/angelbroking/user/v1/loginByPassword",
-  "/angel/refresh":      "/rest/auth/angelbroking/jwt/v1/refreshTokens",
-  "/angel/profile":      "/rest/secure/angelbroking/user/v1/getProfile",
-  "/angel/user/profile": "/rest/secure/angelbroking/user/v1/getProfile",
-  "/angel/quote":        "/rest/secure/angelbroking/market/v1/quote/",
-  "/angel/optionchain":  "/rest/secure/angelbroking/market/v1/optionchain",
-  "/angel/expiry":       "/rest/secure/angelbroking/market/v1/expiry",
-  "/angel/order/book":   "/rest/secure/angelbroking/order/v1/getOrderBook",
-  "/angel/order/place":  "/rest/secure/angelbroking/order/v1/placeOrder",
-  "/angel/order/modify": "/rest/secure/angelbroking/order/v1/modifyOrder",
-  "/angel/order/cancel": "/rest/secure/angelbroking/order/v1/cancelOrder",
-  "/angel/position":     "/rest/secure/angelbroking/order/v1/getPosition",
-  "/angel/holding":      "/rest/secure/angelbroking/portfolio/v1/getHolding",
-  "/angel/scripmaster":  "/rest/secure/angelbroking/market/v1/scripmaster",
-};
+// ── Simple Express-less HTTP server
+const server = http.createServer((req, res) => {
+  // CORS headers — browser se direct call allow karo
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-UserType, X-SourceID, X-ClientLocalIP, X-ClientPublicIP, X-MACAddress, X-PrivateKey, X-Proxy-Secret");
 
-// CORS
-app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "*");
-  if (req.method === "OPTIONS") return res.sendStatus(200);
-  next();
-});
+  if (req.method === "OPTIONS") {
+    res.writeHead(204); res.end(); return;
+  }
 
-app.use(express.json());
+  const parsedUrl = url.parse(req.url, true);
+  const pathname  = parsedUrl.pathname;
 
-app.get("/", (req, res) => res.json({ status: "ok", message: "✅ Proxy Running" }));
-app.get("/health", (req, res) => res.json({ status: "ok" }));
+  // ── Health check
+  if (pathname === "/health" || pathname === "/") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: "ok", ts: Date.now() }));
+    return;
+  }
 
-async function proxyTo(targetUrl, req, res) {
-  try {
-    const fetch = (await import("node-fetch")).default;
-    
-    // Forward all Angel One required headers
-    const headers = {
-      "Content-Type": "application/json",
-      "Accept": "application/json",
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-      "X-ClientLocalIP": req.headers["x-clientlocalip"] || req.headers["x-client-local-ip"] || "127.0.0.1",
-      "X-ClientPublicIP": req.headers["x-clientpublicip"] || req.headers["x-client-public-ip"] || "127.0.0.1",
-      "X-MACAddress": req.headers["x-macaddress"] || req.headers["x-mac-address"] || "00:00:00:00:00:00",
-    };
+  // ── Ping
+  if (pathname === "/ping") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ pong: true, ts: Date.now() }));
+    return;
+  }
 
-    // Forward auth headers
-    const authHeaders = ["authorization", "x-privatekey", "x-privateclientid", 
-      "x-privateclientkey", "x-api-key", "x-usertype", "x-sourceid",
-      "x-clientcode", "x-feedtoken"];
-    for (const h of authHeaders) {
-      if (req.headers[h]) headers[h] = req.headers[h];
+  // ── Angel One REST API proxy (/api/*)
+  if (pathname.startsWith("/api/")) {
+    // Secret check (optional — set PROXY_SECRET="" to disable)
+    if (PROXY_SECRET) {
+      const clientSecret = req.headers["x-proxy-secret"] || "";
+      if (clientSecret !== PROXY_SECRET) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Forbidden — invalid proxy secret" }));
+        return;
+      }
     }
 
-    console.log(`[PROXY] ${req.method} ${targetUrl}`);
+    // Strip /api prefix → forward to Angel One
+    const angelPath = pathname.replace(/^\/api/, "");
+    const options = {
+      hostname: "apiconnect.angelone.in",
+      path:     angelPath + (parsedUrl.search || ""),
+      method:   req.method,
+      headers:  {
+        ...req.headers,
+        host: "apiconnect.angelone.in",
+      },
+    };
+    delete options.headers["x-proxy-secret"]; // don't forward our secret
 
-    const response = await fetch(targetUrl, {
-      method: req.method,
-      headers,
-      body: ["GET", "HEAD"].includes(req.method) ? undefined : JSON.stringify(req.body),
+    const proxyReq = https.request(options, (proxyRes) => {
+      res.writeHead(proxyRes.statusCode, {
+        ...proxyRes.headers,
+        "access-control-allow-origin": "*",
+      });
+      proxyRes.pipe(res);
     });
 
-    const data = await response.text();
-    console.log(`[PROXY] Response ${response.status}: ${data.substring(0, 100)}`);
-    
-    const ct = response.headers.get("content-type") || "application/json";
-    res.status(response.status).set("content-type", ct).send(data);
-  } catch (err) {
-    console.error(`[PROXY ERROR] ${err.message}`);
-    res.status(500).json({ error: err.message });
+    proxyReq.on("error", (e) => {
+      res.writeHead(502, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Proxy error", detail: e.message }));
+    });
+
+    req.pipe(proxyReq);
+    return;
   }
-}
 
-// Angel One routes
-app.all("/angel*", (req, res) => {
-  const mapped = ANGEL_PATH_MAP[req.path];
-  if (mapped) return proxyTo(`${ANGEL_BASE}${mapped}`, req, res);
-  // scripmaster with exchange param
-  if (req.path.startsWith("/angel/scripmaster/")) {
-    const exchange = req.path.split("/angel/scripmaster/")[1];
-    return proxyTo(`${ANGEL_BASE}/rest/secure/angelbroking/market/v1/scripmaster?exchange=${exchange}`, req, res);
+  // ── 404
+  res.writeHead(404, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: "Not found", path: pathname }));
+});
+
+// ── WebSocket server — /ws endpoint
+const wss = new WebSocket.Server({ noServer: true });
+
+// Upgrade handler — sirf /ws path ke liye accept karo
+server.on("upgrade", (req, socket, head) => {
+  const parsedUrl = url.parse(req.url, true);
+
+  if (parsedUrl.pathname !== "/ws") {
+    socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+    socket.destroy();
+    return;
   }
-  const path = req.path.replace(/^\/angel/, "") || "/";
-  proxyTo(`${ANGEL_BASE}${path}`, req, res);
-});
 
-// Dhan routes
-app.all("/dhan*", (req, res) => {
-  const path = req.path.replace(/^\/dhan/, "") || "/";
-  proxyTo(`${DHAN_BASE}${path}`, req, res);
-});
+  // Optional secret check via query param or header
+  if (PROXY_SECRET) {
+    const qSecret = parsedUrl.query["secret"] || "";
+    const hSecret = req.headers["x-proxy-secret"] || "";
+    if (qSecret !== PROXY_SECRET && hSecret !== PROXY_SECRET) {
+      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+  }
 
-// NSE routes
-app.all("/nse*", (req, res) => {
-  const path = req.path.replace(/^\/nse/, "") || "/";
-  proxyTo(`${NSE_BASE}${path}`, req, res);
-});
-
-// WebSocket proxy
-const wss = new WebSocket.Server({ server });
-wss.on("connection", (clientWs) => {
-  console.log("🔌 WS Client connected");
-  const angelWs = new WebSocket(ANGEL_ONE_WS, {
-    headers: { Origin: "https://smartapi.angelone.in" },
+  wss.handleUpgrade(req, socket, head, (clientWs) => {
+    wss.emit("connection", clientWs, req);
   });
-  clientWs.on("message", (data) => { if (angelWs.readyState === WebSocket.OPEN) angelWs.send(data); });
-  angelWs.on("message", (data) => { if (clientWs.readyState === WebSocket.OPEN) clientWs.send(data); });
-  angelWs.on("open", () => console.log("✅ Angel One WS connected"));
-  angelWs.on("error", (err) => { console.error("❌ WS:", err.message); try { clientWs.close(); } catch(_){} });
-  angelWs.on("close", () => { try { clientWs.close(); } catch(_){} });
-  clientWs.on("close", () => { try { angelWs.close(); } catch(_){} });
-  clientWs.on("error", () => { try { angelWs.close(); } catch(_){} });
 });
 
-server.listen(PORT, () => console.log(`🚀 Proxy on port ${PORT}`));
+// ── WS connection handler — bridge client ↔ Angel One
+wss.on("connection", (clientWs, req) => {
+  const clientIp = req.socket.remoteAddress || "unknown";
+  console.log(`[WS] Client connected: ${clientIp}`);
+
+  let angelWs    = null;
+  let pingTimer  = null;
+  let destroyed  = false;
+
+  // Connect to Angel One SmartStream
+  function connectToAngel() {
+    angelWs = new WebSocket(ANGEL_WS_URL, {
+      headers: {
+        "Origin": "https://smartapi.angelone.in",
+      }
+    });
+
+    angelWs.on("open", () => {
+      console.log(`[WS] Angel One connected for client: ${clientIp}`);
+
+      // Ping Angel One every 25s (Angel One requirement)
+      pingTimer = setInterval(() => {
+        if (angelWs.readyState === WebSocket.OPEN) {
+          angelWs.ping();
+        }
+      }, 25000);
+    });
+
+    // Angel → Client relay (text frames: auth responses, errors)
+    angelWs.on("message", (data, isBinary) => {
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(data, { binary: isBinary });
+      }
+    });
+
+    angelWs.on("ping", () => {
+      try { angelWs.pong(); } catch(_) {}
+    });
+
+    angelWs.on("error", (err) => {
+      console.error(`[WS] Angel One error: ${err.message}`);
+      if (clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(JSON.stringify({
+          type: "error",
+          message: `Angel One WS error: ${err.message}`
+        }));
+      }
+    });
+
+    angelWs.on("close", (code, reason) => {
+      console.log(`[WS] Angel One disconnected: ${code} ${reason}`);
+      clearInterval(pingTimer);
+      if (!destroyed && clientWs.readyState === WebSocket.OPEN) {
+        clientWs.close(code, reason);
+      }
+    });
+  }
+
+  connectToAngel();
+
+  // Client → Angel relay (text: auth/subscribe JSON; binary: ping frames)
+  clientWs.on("message", (data, isBinary) => {
+    if (angelWs && angelWs.readyState === WebSocket.OPEN) {
+      angelWs.send(data, { binary: isBinary });
+    }
+  });
+
+  clientWs.on("ping", () => {
+    try { clientWs.pong(); } catch(_) {}
+  });
+
+  clientWs.on("close", (code, reason) => {
+    console.log(`[WS] Client disconnected: ${clientIp} (${code})`);
+    destroyed = true;
+    clearInterval(pingTimer);
+    if (angelWs) {
+      try { angelWs.close(1000, "client_disconnected"); } catch(_) {}
+    }
+  });
+
+  clientWs.on("error", (err) => {
+    console.error(`[WS] Client error: ${err.message}`);
+  });
+});
+
+// ── Start server
+server.listen(PORT, () => {
+  console.log(`ws-proxy running on port ${PORT}`);
+  console.log(`  REST: http://localhost:${PORT}/api/...`);
+  console.log(`  WS:   ws://localhost:${PORT}/ws`);
+  console.log(`  Secret: ${PROXY_SECRET ? "SET ✓" : "NOT SET (open)"}`);
+});
